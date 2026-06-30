@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PUZZLE·CAM</title>
+<style>
+  :root{--bg:#0b0b0d;--fg:#eee;--accent:#ffd34d;--grid:#4caf50;--ok:#4caf50;--panel:#16161a;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:"Segoe UI",Arial,sans-serif;
+       display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:16px;}
+  h1{letter-spacing:.15em;font-size:1.1rem;margin:8px 0 4px;}
+  #status{font-size:.85rem;color:var(--accent);min-height:1.2em;margin-bottom:4px;text-align:center;}
+  #roundIndicator{font-size:.75rem;color:#999;margin-bottom:8px;text-align:center;}
+  #stage{position:relative;width:min(92vw,480px);height:min(92vw,480px);background:#000;
+         border-radius:8px;overflow:hidden;box-shadow:0 0 0 1px #333;}
+  video{position:absolute;width:1px;height:1px;opacity:0;}
+  canvas#view{width:100%;height:100%;display:block;}
+  #counter{font-size:.85rem;margin-top:10px;color:#aaa;}
+  #hint{font-size:.72rem;color:#777;margin-top:10px;text-align:center;max-width:480px;line-height:1.5;}
+  #thumbRow{display:flex;gap:8px;margin-top:10px;}
+  #thumbRow canvas{width:54px;height:54px;border:1px solid #444;border-radius:4px;background:#111;}
+  #thumbRow canvas.empty{opacity:.25;}
+  #stripPanel{display:none;flex-direction:column;align-items:center;gap:12px;margin-top:10px;}
+  #stripPanel canvas{max-width:min(70vw,260px);border:1px solid #333;border-radius:6px;background:#fff;}
+  button{background:var(--panel);color:var(--fg);border:1px solid #444;border-radius:6px;
+         padding:10px 18px;font-size:.85rem;cursor:pointer;}
+  button:hover{border-color:var(--accent);color:var(--accent);}
+  #btnRow{display:flex;gap:10px;}
+  .hidden{display:none!important;}
+</style>
+</head>
+<body>
+  <h1>PUZZLE·CAM</h1>
+  <div id="status">Iniciando cámara…</div>
+  <div id="roundIndicator"></div>
+  <div id="stage">
+    <video id="webcam" playsinline autoplay muted></video>
+    <canvas id="view" width="480" height="480"></canvas>
+  </div>
+  <div id="counter"></div>
+  <div id="thumbRow"></div>
+  <div id="hint">
+    Pinch con ambas manos y mantenlo 1.5s para capturar la foto de esta ronda · Pinch una mano sobre una pieza
+    para arrastrarla · Cierra el puño cuando el rompecabezas esté completo para confirmar la ronda ·
+    son 3 rondas / 3 fotos distintas antes de generar la tira
+  </div>
+
+  <div id="stripPanel">
+    <canvas id="stripCanvas"></canvas>
+    <div id="btnRow">
+      <button id="downloadBtn">Descargar tira</button>
+      <button id="resetBtn">Reiniciar todo</button>
+    </div>
+  </div>
+
+<!-- versiones fijas: evita romper la app cuando upstream actualiza "latest" -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const SIZE = 480, GRID = 3, CELL = SIZE / GRID, ROUNDS = 3;
+  const HANDS_VERSION = '0.4.1675469240'; // debe coincidir con el script tag de arriba
+
+  const video = document.getElementById('webcam');
+  const view  = document.getElementById('view');
+  const ctx   = view.getContext('2d');
+  const statusEl  = document.getElementById('status');
+  const roundEl   = document.getElementById('roundIndicator');
+  const counterEl = document.getElementById('counter');
+  const thumbRow  = document.getElementById('thumbRow');
+  const stripPanel = document.getElementById('stripPanel');
+  const stripCanvas = document.getElementById('stripCanvas');
+  const downloadBtn = document.getElementById('downloadBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  view.width = view.height = SIZE;
+
+  // ---- estado general ----
+  let appState = 'loading';      // loading | tracking | countdown | puzzle | complete | saved
+  let latestLandmarks = [];      // landmarks crudos de MediaPipe (sin mirror)
+  let latestHandedness = [];     // [{label:'Left'|'Right', score}, ...] paralelo a latestLandmarks
+
+  // canvas con el frame congelado en B&N de la RONDA ACTUAL (el que se arma)
+  const captureCanvas = document.createElement('canvas');
+  captureCanvas.width = captureCanvas.height = SIZE;
+  const cctx = captureCanvas.getContext('2d', { willReadFrequently: true });
+
+  // canvas auxiliar para procesar el video en vivo antes de pintarlo en pantalla
+  const offscreen = document.createElement('canvas');
+  offscreen.width = offscreen.height = SIZE;
+  const offCtx = offscreen.getContext('2d', { willReadFrequently: true });
+
+  let bothPinchStart = null;
+  let countdownStart = null;
+  let processing = false; // evita solapar llamadas a hands.send()
+
+  // ---- galería de fotos capturadas (una por ronda, todas distintas) ----
+  let capturedFrames = []; // canvases clonados, una por ronda ya confirmada
+  let roundIndex = 0;      // ronda actual (0-based), 0..ROUNDS-1
+
+  // ---- puzzle ----
+  let occupant = [];             // occupant[slot] = pieceId | null
+  let dragging = null;           // {pieceId, emptySlot, x, y, handLabel}
+
+  // ---- identidad de mano + hysteresis de pinch ----
+  const handTrack = new Map();
+  const PINCH_ENTER = 0.42; // umbral para EMPEZAR a considerar pinch (más permisivo)
+  const PINCH_EXIT  = 0.58; // umbral para DEJAR de considerar pinch (más estricto) -> hysteresis
+  const TIP_SMOOTH  = 0.55; // suavizado EMA de la punta del índice, reduce jitter en bordes de celda
+
+  function shuffledPermutation(n) {
+    let arr = [...Array(n).keys()];
+    let isIdentity = true;
+    do {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      isIdentity = arr.every((v, i) => v === i);
+    } while (isIdentity);
+    return arr;
+  }
+
+  function startPuzzle() {
+    occupant = shuffledPermutation(GRID * GRID);
+    dragging = null;
+    appState = 'puzzle';
+  }
+
+  function placedCount() {
+    return occupant.reduce((acc, p, idx) => acc + (p === idx ? 1 : 0), 0);
+  }
+
+  function cloneCanvas(src) {
+    const c = document.createElement('canvas');
+    c.width = src.width; c.height = src.height;
+    c.getContext('2d').drawImage(src, 0, 0);
+    return c;
+  }
+
+  function updateRoundIndicator() {
+    roundEl.textContent = `Foto ${Math.min(roundIndex + 1, ROUNDS)} de ${ROUNDS}`;
+    renderThumbs();
+  }
+
+  function renderThumbs() {
+    thumbRow.innerHTML = '';
+    for (let i = 0; i < ROUNDS; i++) {
+      const c = document.createElement('canvas');
+      c.width = c.height = 54;
+      const tctx = c.getContext('2d');
+      if (capturedFrames[i]) {
+        tctx.drawImage(capturedFrames[i], 0, 0, SIZE, SIZE, 0, 0, 54, 54);
+      } else {
+        c.classList.add('empty');
+      }
+      thumbRow.appendChild(c);
+    }
+  }
+
+  // ---- conversión a blanco y negro (más barato y estable que ctx.filter) ----
+  function applyGrayscaleContrast(c, w, h, contrast = 1.08) {
+    const imgData = c.getImageData(0, 0, w, h);
+    const data = imgData.data;
+    const intercept = 128 * (1 - contrast);
+    for (let i = 0; i < data.length; i += 4) {
+      let lum = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+      lum = lum * contrast + intercept;
+      lum = lum < 0 ? 0 : (lum > 255 ? 255 : lum);
+      data[i] = data[i + 1] = data[i + 2] = lum;
+    }
+    c.putImageData(imgData, 0, 0);
+  }
+
+  // ---- recorte "cover": toma el cuadro central más grande posible de lo que
+  // entregue la cámara (sea 4:3, 16:9, lo que sea) y nunca estira la imagen ----
+  function drawVideoCover(targetCtx, size) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    const side = Math.min(vw, vh);
+    const sx = (vw - side) / 2;
+    const sy = (vh - side) / 2;
+    targetCtx.drawImage(video, sx, sy, side, side, 0, 0, size, size);
+  }
+
+  // ---- utilidades de mano ----
+  function mirroredPx(lm) { return { x: (1 - lm.x) * SIZE, y: lm.y * SIZE }; }
+
+  function palmSize(lms) {
+    const w = lms[0], m = lms[9];
+    return Math.hypot(w.x - m.x, w.y - m.y) || 0.001;
+  }
+
+  function pinchDistRatio(lms) {
+    const thumb = lms[4], index = lms[8];
+    const d = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+    return d / palmSize(lms);
+  }
+
+  function isFist(lms) {
+    const wrist = lms[0];
+    const tips = [8, 12, 16, 20];
+    const avg = tips.reduce((s, i) => s + Math.hypot(lms[i].x - wrist.x, lms[i].y - wrist.y), 0) / tips.length;
+    return avg < palmSize(lms) * 1.15;
+  }
+
+  function slotIndexFromPx(px, py) {
+    let col = Math.min(GRID - 1, Math.max(0, Math.floor(px / CELL)));
+    let row = Math.min(GRID - 1, Math.max(0, Math.floor(py / CELL)));
+    return row * GRID + col;
+  }
+
+  // ---- MediaPipe Hands ----
+  const hands = new Hands({
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${HANDS_VERSION}/${f}`
+  });
+  // modelComplexity 0 = modelo "lite": mucho más rápido en CPU sin GPU dedicada (T440p)
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.55, minTrackingConfidence: 0.5 });
+  hands.onResults((res) => {
+    latestLandmarks = res.multiHandLandmarks || [];
+    latestHandedness = res.multiHandedness || [];
+  });
+
+  navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 480 }, audio: false })
+    .then((stream) => {
+      video.srcObject = stream;
+      video.onloadedmetadata = () => {
+        appState = 'tracking';
+        statusEl.textContent = 'manos en seguimiento';
+        updateRoundIndicator();
+        startInferenceLoop();
+        requestAnimationFrame(renderLoop);
+      };
+    })
+    .catch((err) => {
+      console.error('getUserMedia error:', err.name, err.message);
+      statusEl.textContent = `No se pudo acceder a la cámara (${err.name})`;
+    });
+
+  // ---- loop de inferencia (MediaPipe), desacoplado del render ----
+  let lastSend = 0;
+  function startInferenceLoop() {
+    const supportsRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+    async function runInference() {
+      if (processing || appState === 'saved' || video.readyState < 2) return;
+      processing = true;
+      try { await hands.send({ image: video }); }
+      finally { processing = false; }
+    }
+
+    if (supportsRVFC) {
+      const onFrame = async () => {
+        await runInference();
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+    } else {
+      const tick = async (now) => {
+        if (now - lastSend > 33) {
+          lastSend = now;
+          await runInference();
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+  }
+
+  function renderLoop(now) {
+    draw(now);
+    requestAnimationFrame(renderLoop);
+  }
+
+  // ---- captura (usa recorte cover, nunca estira) ----
+  function captureFrame() {
+    cctx.save();
+    cctx.translate(SIZE, 0);
+    cctx.scale(-1, 1);
+    drawVideoCover(cctx, SIZE);
+    cctx.restore();
+    applyGrayscaleContrast(cctx, SIZE, SIZE);
+  }
+
+  // ---- procesa manos: identidad estable por handedness + hysteresis de pinch + smoothing ----
+  function processHands() {
+    const seenLabels = new Set();
+    const out = [];
+
+    for (let i = 0; i < latestLandmarks.length; i++) {
+      const lms = latestLandmarks[i];
+      const label = (latestHandedness[i] && latestHandedness[i].label) || `idx${i}`;
+      seenLabels.add(label);
+
+      let track = handTrack.get(label);
+      if (!track) {
+        track = { pinching: false, smTipX: null, smTipY: null };
+        handTrack.set(label, track);
+      }
+
+      const ratio = pinchDistRatio(lms);
+      track.pinching = track.pinching ? (ratio < PINCH_EXIT) : (ratio < PINCH_ENTER);
+
+      const rawTip = mirroredPx(lms[8]);
+      if (track.smTipX === null) {
+        track.smTipX = rawTip.x; track.smTipY = rawTip.y;
+      } else {
+        track.smTipX += (rawTip.x - track.smTipX) * TIP_SMOOTH;
+        track.smTipY += (rawTip.y - track.smTipY) * TIP_SMOOTH;
+      }
+
+      out.push({
+        label,
+        lms,
+        px: lms.map(mirroredPx),
+        tip: { x: track.smTipX, y: track.smTipY },
+        pinching: track.pinching,
+        fist: isFist(lms),
+      });
+    }
+
+    for (const label of handTrack.keys()) {
+      if (!seenLabels.has(label)) handTrack.delete(label);
+    }
+
+    return out;
+  }
+
+  // ---- render principal ----
+  function draw(now) {
+    if (appState === 'saved') return;
+
+    ctx.save();
+    if (appState === 'puzzle' || appState === 'complete') {
+      ctx.drawImage(captureCanvas, 0, 0);
+    } else if (video.readyState >= 2) {
+      offCtx.save();
+      offCtx.translate(SIZE, 0);
+      offCtx.scale(-1, 1);
+      drawVideoCover(offCtx, SIZE);
+      offCtx.restore();
+      applyGrayscaleContrast(offCtx, SIZE, SIZE);
+      ctx.drawImage(offscreen, 0, 0);
+    }
+    ctx.restore();
+
+    const handsNow = processHands();
+
+    if (appState === 'tracking') {
+      drawSkeletons(handsNow);
+      const bothPinching = handsNow.length === 2 && handsNow[0].pinching && handsNow[1].pinching;
+      if (bothPinching) {
+        if (bothPinchStart === null) bothPinchStart = now;
+        const elapsed = now - bothPinchStart;
+        statusEl.textContent = `congelando… ${Math.max(0, Math.ceil((1500 - elapsed) / 1000))}`;
+        if (elapsed >= 1500) {
+          appState = 'countdown';
+          countdownStart = now;
+          bothPinchStart = null;
+        }
+      } else {
+        bothPinchStart = null;
+        statusEl.textContent = `manos en seguimiento — ronda ${roundIndex + 1}/${ROUNDS}`;
+      }
+      counterEl.textContent = '';
+    }
+
+    else if (appState === 'countdown') {
+      drawSkeletons(handsNow);
+      const remaining = 3000 - (now - countdownStart);
+      const n = Math.ceil(remaining / 1000);
+      statusEl.textContent = `capturando en ${Math.max(n, 1)}…`;
+      ctx.fillStyle = '#ffd34d';
+      ctx.font = 'bold 140px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(Math.max(n, 1)), SIZE / 2, SIZE / 2);
+      if (remaining <= 0) {
+        captureFrame();
+        startPuzzle();
+      }
+    }
+
+    else if (appState === 'puzzle' || appState === 'complete') {
+      handlePuzzleInteraction(handsNow);
+      drawPuzzleGrid();
+      drawSkeletons(handsNow);
+
+      const pc = placedCount();
+      counterEl.textContent = `${pc} / ${GRID * GRID} piezas colocadas`;
+
+      if (pc === GRID * GRID) {
+        if (appState !== 'complete') appState = 'complete';
+        statusEl.textContent = '¡ROMPECABEZAS COMPLETO! cierra el puño para confirmar la ronda';
+        if (handsNow.some(h => h.fist)) onRoundComplete();
+      } else {
+        appState = 'puzzle';
+        statusEl.textContent = 'arma el rompecabezas con pinch';
+      }
+    }
+  }
+
+  function drawSkeletons(handsNow) {
+    if (!window.HAND_CONNECTIONS) return;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillStyle = '#ffd34d';
+    handsNow.forEach(({ px }) => {
+      HAND_CONNECTIONS.forEach(([a, b]) => {
+        ctx.beginPath();
+        ctx.moveTo(px[a].x, px[a].y);
+        ctx.lineTo(px[b].x, px[b].y);
+        ctx.stroke();
+      });
+      px.forEach((p) => {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    });
+  }
+
+  function drawPuzzleGrid() {
+    ctx.strokeStyle = '#4caf50';
+    ctx.lineWidth = 1.5;
+    for (let slot = 0; slot < GRID * GRID; slot++) {
+      if (dragging && dragging.emptySlot === slot) continue;
+      const pieceId = occupant[slot];
+      const sCol = pieceId % GRID, sRow = Math.floor(pieceId / GRID);
+      const dCol = slot % GRID, dRow = Math.floor(slot / GRID);
+      ctx.drawImage(captureCanvas, sCol * CELL, sRow * CELL, CELL, CELL, dCol * CELL, dRow * CELL, CELL, CELL);
+      ctx.strokeStyle = pieceId === slot ? '#ffd34d' : '#4caf50';
+      ctx.strokeRect(dCol * CELL + 1, dRow * CELL + 1, CELL - 2, CELL - 2);
+    }
+    if (dragging) {
+      const pieceId = dragging.pieceId;
+      const sCol = pieceId % GRID, sRow = Math.floor(pieceId / GRID);
+      const half = CELL / 2;
+      ctx.save();
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 10;
+      ctx.drawImage(captureCanvas, sCol * CELL, sRow * CELL, CELL, CELL,
+                     dragging.x - half, dragging.y - half, CELL, CELL);
+      ctx.restore();
+      ctx.strokeStyle = '#ffd34d';
+      ctx.strokeRect(dragging.x - half, dragging.y - half, CELL, CELL);
+    }
+  }
+
+  function handlePuzzleInteraction(handsNow) {
+    for (const h of handsNow) {
+      const { label, tip, pinching } = h;
+
+      if (!dragging && pinching) {
+        const slot = slotIndexFromPx(tip.x, tip.y);
+        const pieceId = occupant[slot];
+        if (pieceId !== null && pieceId !== undefined) {
+          dragging = { pieceId, emptySlot: slot, x: tip.x, y: tip.y, handLabel: label };
+          occupant[slot] = null;
+        }
+      } else if (dragging && dragging.handLabel === label) {
+        if (pinching) {
+          dragging.x = tip.x;
+          dragging.y = tip.y;
+        } else {
+          const targetSlot = slotIndexFromPx(tip.x, tip.y);
+          if (targetSlot === dragging.emptySlot) {
+            occupant[dragging.emptySlot] = dragging.pieceId;
+          } else {
+            const other = occupant[targetSlot];
+            occupant[targetSlot] = dragging.pieceId;
+            occupant[dragging.emptySlot] = other;
+          }
+          dragging = null;
+        }
+      }
+    }
+  }
+
+  // ---- al confirmar una ronda con el puño: guarda esta foto y avanza, o cierra la tira ----
+  function onRoundComplete() {
+    capturedFrames.push(cloneCanvas(captureCanvas));
+    roundIndex++;
+
+    if (roundIndex < ROUNDS) {
+      occupant = [];
+      dragging = null;
+      bothPinchStart = null;
+      countdownStart = null;
+      appState = 'tracking';
+      statusEl.textContent = `ronda ${roundIndex} guardada — prepara la pose para la foto ${roundIndex + 1}`;
+      updateRoundIndicator();
+    } else {
+      saveStrip();
+    }
+  }
+
+  // ---- tira final: celdas cuadradas, sin segundo estiramiento ----
+  function saveStrip() {
+    appState = 'saved';
+    const w = 320, gap = 18, headerH = 60, footerH = 40;
+    const frame = w - gap * 2; // celda CUADRADA: mismo ancho y alto
+    stripCanvas.width = w;
+    stripCanvas.height = headerH + frame * ROUNDS + gap * (ROUNDS + 1) + footerH;
+    const sctx = stripCanvas.getContext('2d');
+
+    sctx.fillStyle = '#ffffff';
+    sctx.fillRect(0, 0, stripCanvas.width, stripCanvas.height);
+
+    sctx.fillStyle = '#111';
+    sctx.font = 'bold 22px Arial';
+    sctx.textAlign = 'center';
+    sctx.fillText('PUZZLE · CAM', w / 2, 36);
+
+    for (let i = 0; i < ROUNDS; i++) {
+      const y = headerH + gap + i * (frame + gap);
+      sctx.drawImage(capturedFrames[i], 0, 0, SIZE, SIZE, gap, y, frame, frame);
+      sctx.strokeStyle = '#111';
+      sctx.lineWidth = 2;
+      sctx.strokeRect(gap, y, frame, frame);
+    }
+
+    sctx.fillStyle = '#555';
+    sctx.font = '13px Arial';
+    sctx.fillText(new Date().toLocaleString('es-MX'), w / 2, stripCanvas.height - 16);
+
+    document.getElementById('stage').classList.add('hidden');
+    document.getElementById('hint').classList.add('hidden');
+    document.getElementById('thumbRow').classList.add('hidden');
+    counterEl.textContent = '';
+    roundEl.textContent = '';
+    statusEl.textContent = 'tira completa — descarga o reinicia';
+    stripPanel.style.display = 'flex';
+  }
+
+  downloadBtn.onclick = () => {
+    stripCanvas.toBlob((blob) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `puzzlecam_tira_${Date.now()}.png`;
+      a.click();
+    });
+  };
+
+  resetBtn.onclick = () => {
+    occupant = [];
+    dragging = null;
+    bothPinchStart = null;
+    countdownStart = null;
+    capturedFrames = [];
+    roundIndex = 0;
+    handTrack.clear();
+    appState = 'tracking';
+    statusEl.textContent = 'manos en seguimiento';
+    updateRoundIndicator();
+    stripPanel.style.display = 'none';
+    document.getElementById('stage').classList.remove('hidden');
+    document.getElementById('hint').classList.remove('hidden');
+    document.getElementById('thumbRow').classList.remove('hidden');
+  };
+})();
+</script>
+</body>
+</html>
